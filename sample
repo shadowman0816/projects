@@ -1,0 +1,149 @@
+package com.ccb.sns.consumer;
+
+import software.amazon.awssdk.services.sns.SnsClient;
+import software.amazon.awssdk.services.sqs.SqsClient;
+import software.amazon.awssdk.services.sqs.model.*;
+import software.amazon.awssdk.services.sns.model.MessageAttributeValue;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+/**
+ * Main class for consuming messages from AWS SNS via SQS and forwarding them to the appropriate service.
+ */
+public class SnsConsumer {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(SnsConsumer.class);
+
+    private final SqsClient sqsClient;
+    private final String queueUrl;
+    private final ObjectMapper objectMapper;
+    private final EventService eventService;
+
+    public SnsConsumer(SqsClient sqsClient, String queueUrl, EventService eventService) {
+        this.sqsClient = sqsClient;
+        this.queueUrl = queueUrl;
+        this.objectMapper = new ObjectMapper();
+        this.eventService = eventService;
+    }
+
+    public void processMessages() {
+        while (true) {
+            try {
+                ReceiveMessageRequest receiveRequest = ReceiveMessageRequest.builder()
+                        .queueUrl(queueUrl)
+                        .maxNumberOfMessages(10)
+                        .waitTimeSeconds(20)
+                        .messageAttributeNames("All")
+                        .build();
+
+                ReceiveMessageResponse receiveResponse = sqsClient.receiveMessage(receiveRequest);
+                List<Message> messages = receiveResponse.messages();
+
+                for (Message message : messages) {
+                    processMessage(message);
+                }
+            } catch (Exception e) {
+                LOGGER.error("Error while receiving or processing messages", e);
+            }
+        }
+    }
+
+    private void processMessage(Message message) {
+        try {
+            LOGGER.info("Processing message: {}", message.body());
+
+            // Parse message body into Event
+            Event event = objectMapper.readValue(message.body(), Event.class);
+
+            // Validate and forward the event to the appropriate service
+            if (isValidEvent(event)) {
+                eventService.handleEvent(event);
+            } else {
+                LOGGER.warn("Invalid event received: {}", event);
+            }
+
+            // Delete message from SQS after successful processing
+            deleteMessage(message);
+        } catch (Exception e) {
+            LOGGER.error("Error while processing message: {}", message.body(), e);
+        }
+    }
+
+    private boolean isValidEvent(Event event) {
+        // Add validation logic (e.g., check for required fields, valid EINs, etc.)
+        return event != null && event.getEIN() != null && !event.getEIN().isEmpty();
+    }
+
+    private void deleteMessage(Message message) {
+        try {
+            DeleteMessageRequest deleteRequest = DeleteMessageRequest.builder()
+                    .queueUrl(queueUrl)
+                    .receiptHandle(message.receiptHandle())
+                    .build();
+            sqsClient.deleteMessage(deleteRequest);
+            LOGGER.info("Message deleted successfully: {}", message.messageId());
+        } catch (Exception e) {
+            LOGGER.error("Error while deleting message: {}", message.messageId(), e);
+        }
+    }
+
+    public static void main(String[] args) {
+        String queueUrl = System.getenv("SQS_QUEUE_URL");
+
+        if (queueUrl == null || queueUrl.isEmpty()) {
+            throw new IllegalArgumentException("Environment variable SQS_QUEUE_URL is not set.");
+        }
+
+        try (SqsClient sqsClient = SqsClient.create()) {
+            EventService eventService = new EventService(); // Replace with actual implementation
+            SnsConsumer consumer = new SnsConsumer(sqsClient, queueUrl, eventService);
+            consumer.processMessages();
+        } catch (Exception e) {
+            LOGGER.error("Failed to initialize SnsConsumer", e);
+        }
+    }
+}
+
+// Event POJO
+class Event {
+    private String EIN;
+    private String data;
+
+    public String getEIN() {
+        return EIN;
+    }
+
+    public void setEIN(String EIN) {
+        this.EIN = EIN;
+    }
+
+    public String getData() {
+        return data;
+    }
+
+    public void setData(String data) {
+        this.data = data;
+    }
+
+    @Override
+    public String toString() {
+        return "Event{" +
+                "EIN='" + EIN + '\'' +
+                ", data='" + data + '\'' +
+                '}';
+    }
+}
+
+// EventService stub
+class EventService {
+    public void handleEvent(Event event) {
+        // Process the event and forward to relevant service
+        // Example: Publish to another service, persist in DB, etc.
+        System.out.println("Handling event: " + event);
+    }
+}
