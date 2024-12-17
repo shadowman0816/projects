@@ -1,82 +1,170 @@
-package com.ccb.sns.producer;
+package com.ccb.sqs.producer;
 
-import software.amazon.awssdk.services.sns.SnsClient;
-import software.amazon.awssdk.services.sns.model.*;
+import software.amazon.awssdk.services.sqs.SqsClient;
+import software.amazon.awssdk.services.sqs.model.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.Map;
+import java.util.UUID;
 
 /**
- * SNSProducer - Production-ready code for publishing messages to AWS SNS.
+ * SQSProducer - Production-ready code for publishing messages to AWS SQS.
  */
-public class SnsProducer {
+public class SqsProducer {
 
-    private static final Logger LOGGER = LoggerFactory.getLogger(SnsProducer.class);
+    private static final Logger LOGGER = LoggerFactory.getLogger(SqsProducer.class);
 
-    private final SnsClient snsClient;
-    private final String topicArn;
+    private final SqsClient sqsClient;
+    private final String queueUrl;
     private final ObjectMapper objectMapper;
 
-    public SnsProducer(SnsClient snsClient, String topicArn) {
-        this.snsClient = snsClient;
-        this.topicArn = topicArn;
+    public SqsProducer(SqsClient sqsClient, String queueUrl) {
+        this.sqsClient = sqsClient;
+        this.queueUrl = queueUrl;
         this.objectMapper = new ObjectMapper();
     }
 
     /**
-     * Publishes an event to the SNS topic.
-     * @param event Event object to be published.
+     * Publishes a message to the SQS queue.
+     * @param event Event object to be sent.
      */
-    public void publishEvent(Event event) {
+    public void sendMessage(Event event) {
         try {
             String messageBody = objectMapper.writeValueAsString(event);
 
-            PublishRequest publishRequest = PublishRequest.builder()
-                    .topicArn(topicArn)
-                    .message(messageBody)
-                    .messageAttributes(Map.of(
-                            "EIN", MessageAttributeValue.builder()
-                                    .dataType("String")
-                                    .stringValue(event.getEIN())
-                                    .build()
-                    ))
+            SendMessageRequest sendMessageRequest = SendMessageRequest.builder()
+                    .queueUrl(queueUrl)
+                    .messageBody(messageBody)
+                    .messageGroupId("group-" + event.getEIN()) // For FIFO queues
+                    .messageDeduplicationId(UUID.randomUUID().toString())
                     .build();
 
-            PublishResponse response = snsClient.publish(publishRequest);
-            LOGGER.info("Message published successfully. MessageId: {}", response.messageId());
+            SendMessageResponse response = sqsClient.sendMessage(sendMessageRequest);
+            LOGGER.info("Message sent successfully. MessageId: {}", response.messageId());
         } catch (Exception e) {
-            LOGGER.error("Failed to publish message to SNS", e);
+            LOGGER.error("Failed to send message to SQS", e);
+            throw new RuntimeException("Error sending message to SQS", e);
         }
     }
 
     public static void main(String[] args) {
-        String topicArn = System.getenv("SNS_TOPIC_ARN");
-
-        if (topicArn == null || topicArn.isEmpty()) {
-            throw new IllegalArgumentException("Environment variable SNS_TOPIC_ARN is not set.");
+        String queueUrl = ConfigLoader.getProperty("sqs.queue.url");
+        if (queueUrl == null || queueUrl.isEmpty()) {
+            throw new IllegalArgumentException("SQS_QUEUE_URL is not set in properties.");
         }
 
-        try (SnsClient snsClient = SnsClient.create()) {
-            SnsProducer producer = new SnsProducer(snsClient, topicArn);
-
-            // Example event
-            Event event = new Event();
-            event.setEIN("123456789");
-            event.setData("Sample payload data");
-
-            producer.publishEvent(event);
+        try (SqsClient sqsClient = SqsClient.create()) {
+            SqsProducer producer = new SqsProducer(sqsClient, queueUrl);
+            Event event = new Event("123456789", "Sample producer message");
+            producer.sendMessage(event);
         } catch (Exception e) {
-            LOGGER.error("Failed to initialize SnsProducer", e);
+            LOGGER.error("Failed to initialize SqsProducer", e);
         }
     }
 }
 
-// Event POJO
-class Event {
+package com.ccb.sqs.consumer;
+
+import software.amazon.awssdk.services.sqs.SqsClient;
+import software.amazon.awssdk.services.sqs.model.*;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.List;
+
+/**
+ * SQSConsumer - Production-ready code for consuming messages from AWS SQS.
+ */
+public class SqsConsumer {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(SqsConsumer.class);
+
+    private final SqsClient sqsClient;
+    private final String queueUrl;
+    private final ObjectMapper objectMapper;
+    private final EventProcessingService processingService;
+
+    public SqsConsumer(SqsClient sqsClient, String queueUrl, EventProcessingService processingService) {
+        this.sqsClient = sqsClient;
+        this.queueUrl = queueUrl;
+        this.objectMapper = new ObjectMapper();
+        this.processingService = processingService;
+    }
+
+    public void processMessages() {
+        while (true) {
+            try {
+                ReceiveMessageRequest request = ReceiveMessageRequest.builder()
+                        .queueUrl(queueUrl)
+                        .maxNumberOfMessages(5)
+                        .waitTimeSeconds(10)
+                        .build();
+                ReceiveMessageResponse response = sqsClient.receiveMessage(request);
+                List<Message> messages = response.messages();
+
+                for (Message message : messages) {
+                    processMessage(message);
+                }
+            } catch (Exception e) {
+                LOGGER.error("Error receiving messages from SQS", e);
+            }
+        }
+    }
+
+    private void processMessage(Message message) {
+        try {
+            Event event = objectMapper.readValue(message.body(), Event.class);
+            LOGGER.info("Processing message: {}", event);
+            processingService.processEvent(event);
+            deleteMessage(message);
+        } catch (Exception e) {
+            LOGGER.error("Failed to process message: {}", message.body(), e);
+        }
+    }
+
+    private void deleteMessage(Message message) {
+        try {
+            DeleteMessageRequest deleteRequest = DeleteMessageRequest.builder()
+                    .queueUrl(queueUrl)
+                    .receiptHandle(message.receiptHandle())
+                    .build();
+            sqsClient.deleteMessage(deleteRequest);
+            LOGGER.info("Message deleted successfully. MessageId: {}", message.messageId());
+        } catch (Exception e) {
+            LOGGER.error("Failed to delete message: {}", message.messageId(), e);
+        }
+    }
+
+    public static void main(String[] args) {
+        String queueUrl = ConfigLoader.getProperty("sqs.queue.url");
+        if (queueUrl == null || queueUrl.isEmpty()) {
+            throw new IllegalArgumentException("SQS_QUEUE_URL is not set in properties.");
+        }
+
+        try (SqsClient sqsClient = SqsClient.create()) {
+            EventProcessingService processingService = new EventProcessingService();
+            SqsConsumer consumer = new SqsConsumer(sqsClient, queueUrl, processingService);
+            consumer.processMessages();
+        } catch (Exception e) {
+            LOGGER.error("Failed to initialize SqsConsumer", e);
+        }
+    }
+}
+
+package com.ccb.sqs.shared;
+
+public class Event {
     private String EIN;
     private String data;
+
+    public Event() {}
+
+    public Event(String EIN, String data) {
+        this.EIN = EIN;
+        this.data = data;
+    }
 
     public String getEIN() {
         return EIN;
@@ -100,5 +188,20 @@ class Event {
                 "EIN='" + EIN + '\'' +
                 ", data='" + data + '\'' +
                 '}';
+    }
+}
+
+package com.ccb.sqs.service;
+
+import com.ccb.sqs.shared.Event;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class EventProcessingService {
+    private static final Logger LOGGER = LoggerFactory.getLogger(EventProcessingService.class);
+
+    public void processEvent(Event event) {
+        LOGGER.info("Processing event: {}", event);
+        // Add business logic for processing events here.
     }
 }
